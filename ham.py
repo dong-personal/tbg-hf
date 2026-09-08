@@ -25,29 +25,95 @@ def gen_kpath(kpoints, num_kpoints):
     return np.cumsum(np.concatenate([[0], knum]), dtype=int), np.vstack(kpath)
 
 
+def ws_cell(b1, b2, N=4):
+    from scipy.spatial import Voronoi
+
+    # 生成倒格点
+    points = []
+    ij_list = []
+    for i in range(-N, N + 1):
+        for j in range(-N, N + 1):
+            p = i * b1 + j * b2
+            points.append(p)
+            ij_list.append((i, j))
+    points = np.array(points)
+
+    # 找到原点对应的点索引
+    origin_idx = ij_list.index((0, 0))
+
+    # Voronoi 分解
+    vor = Voronoi(points)
+
+    # 原点对应的 region
+    region_idx = vor.point_region[origin_idx]
+    region = vor.regions[region_idx]
+
+    # 如果 region 中有 -1，说明区域无界，通常说明点取太少了
+    if -1 in region or len(region) == 0:
+        raise ValueError("Voronoi region is unbounded. Increase N.")
+
+    vertices = vor.vertices[region]
+
+    # 按角度排序，便于画多边形
+    center = vertices.mean(axis=0)
+    angles = np.arctan2(vertices[:, 1] - center[1], vertices[:, 0] - center[0])
+    order = np.argsort(angles)
+    vertices = vertices[order]
+    poly = np.vstack([vertices, vertices[0]])  # 闭合多边形
+
+    return poly
+
+
+def fold(kpoints, b1, b2, N=4):
+    frac = np.dot(kpoints, np.linalg.inv(np.array([b1, b2])))
+
+    frac_int = np.round(frac).astype(int)
+
+    search = np.arange(-N, N + 1)[:, np.newaxis] + frac_int[np.newaxis, :]
+
+    Gmesh = np.dot(search, np.array([b1, b2]))
+
+    dist = np.linalg.norm(Gmesh - kpoints, axis=1)
+    idx = np.argmin(dist)
+    return kpoints - Gmesh[idx]
+
+
 @dataclass
 class BMHamSetter:
     trad: float = np.deg2rad(1.05)
     dcc: float = 0.142
-    hv: float = 2.1354 * np.sqrt(3) * dcc * 1
-    gammaAA: float = 0.0797
-    gammaAB: float = 0.0975
+    hv: float = 2.15 * np.sqrt(3) * dcc * 1
+    gammaAA: float = 0.1
+    gammaAB: float = 0.1
     a: float = 0.246
     cutoff: int = 4
     mass_term: float = 0.0
 
     # strain
-    exxT: float = 0
-    eyyT: float = 0
-    exyT: float = 0
+    Vg: float = 4  # Scalar potential
+    bG: float = 3.14  # Grüneisen parameter
 
-    exxB: float = 0
-    eyyB: float = 0
-    exyB: float = 0
+    eh: float = 0
+    phi: float = 0
+    strain_type: str = "uni"
+
+    # exxT: float = 0
+    # eyyT: float = 0
+    # exyT: float = 0
+
+    # exxB: float = 0
+    # eyyB: float = 0
+    # exyB: float = 0
 
     test: bool = True
 
     def __post_init__(self):
+        if self.strain_type == "uni":
+            self.set_uni(self.eh, self.phi)
+        elif self.strain_type == "shear":
+            self.set_shear(self.eh, self.phi)
+        else:
+            raise ValueError("Invalid strain type. Choose 'uni' or 'shear'.")
 
         self.E_t = np.array([[self.exxT, self.exyT], [self.exyT, self.eyyT]])
         self.E_b = np.array([[self.exxB, self.exyB], [self.exyB, self.eyyB]])
@@ -70,17 +136,51 @@ class BMHamSetter:
         self.preft = self.Rt.T @ (I + self.E_t)
         self.prefb = self.Rb.T @ (I + self.E_b)
 
+        self.ctp, self.cbp = self._build_strain_correction(v=1)
+        self.ctn, self.cbn = self._build_strain_correction(v=-1)
+
+    def _build_strain_correction(self, v):
+        facA = self.bG / (2 * self.dcc)
+        At = facA * np.array([self.exxT - self.eyyT, -2 * self.exyT])  # top layer
+        Ab = facA * np.array([self.exxB - self.eyyB, -2 * self.exyB])  # bottom layer
+
+        kt = self.preft @ At
+        kb = self.prefb @ Ab
+
+        Vt = self.Vg * (self.exxT + self.eyyT) * np.eye(2)  # top layer
+        Vb = self.Vg * (self.exxB + self.eyyB) * np.eye(2)  # bottom layer
+
+        hAt = v * self.h0(kt, v)
+        hAb = v * self.h0(kb, v)
+
+        ct = Vt + hAt
+        cb = Vb + hAb
+
+        return ct, cb
+
     def _build_lattice(self):
 
         b0 = (4 * np.pi / (np.sqrt(3) * self.a)) * np.array(
             [[np.sqrt(3) / 2, -1 / 2], [0, 1]]
         )
+
         I = np.eye(2)
         T = (I - self.E_b) @ self.Rb - (I - self.E_t) @ self.Rt
 
         self.G = b0 @ T.T
 
         self.G = np.array([[-1, -1], [1, 0]]) @ self.G
+
+        K0 = (b0[0] + 2 * b0[1]) / 3.0
+
+        KT = (I - self.E_b) @ self.Rt @ K0
+        KB = (I - self.E_t) @ self.Rb @ K0
+
+        self.KT = fold(KT, self.G[0], self.G[1], N=4)
+        self.KB = fold(KB, self.G[0], self.G[1], N=4)
+
+        # self.KT = np.dot(fracT, self.G)
+        # self.KB = np.dot(fracB, self.G)
 
         q1 = (self.G[0] - self.G[1]) / 3.0
         q2 = q1 + self.G[1]
@@ -89,23 +189,28 @@ class BMHamSetter:
         self.Kt = q2
         self.Kb = -q3
 
-        self.mbz = np.array([q1, -q3, q2, -q1, q3, -q2, q1])
+        # self.Kt = self.KT
+        # self.Kb = self.KB
+
+        # self.mbz = np.array([q1, -q3, q2, -q1, q3, -q2, q1])
+        self.mbz = ws_cell(self.G[0], self.G[1], N=4)
 
         self.Acr = np.abs(np.linalg.det(self.G))
 
         self.lat = 2 * np.pi * np.linalg.inv(self.G).T
 
-        q1R = -(2 * self.lat[0] - self.lat[1]) / 3
-        q2R = q1R + self.lat[0]
-        q3R = q1R + self.lat[0] - self.lat[1]
+        # q1R = -(2 * self.lat[0] - self.lat[1]) / 3
+        # q2R = q1R + self.lat[0]
+        # q3R = q1R + self.lat[0] - self.lat[1]
 
         self.Ac = np.abs(np.linalg.det(self.lat))
 
-        self.WScell = np.array([q1R, -q3R, q2R, -q1R, q3R, -q2R, q1R])
+        # self.WScell = np.array([q1R, -q3R, q2R, -q1R, q3R, -q2R, q1R])
+        self.WScell = ws_cell(self.lat[0], self.lat[1], N=4)
 
     def _build_Gmesh(self):
 
-        Gcut = self.cutoff * np.min(np.linalg.norm(self.G, axis=1))
+        Gcut = self.cutoff * np.max(np.linalg.norm(self.G, axis=1))
         expand_times = self.cutoff + 2
         X, Y = np.meshgrid(
             np.arange(-expand_times, expand_times),
@@ -137,8 +242,17 @@ class BMHamSetter:
             plt.title("G mesh points")
             plt.plot(self.mbz[:, 0], self.mbz[:, 1], color="red", lw=2, label="MBZ")
             plt.plot(A_cell[:, 0], A_cell[:, 1], color="green", lw=2, label="Unit Cell")
+
+            plt.scatter(self.KT[0], self.KT[1], color="orange", s=150, label="K point")
+            plt.scatter(self.KB[0], self.KB[1], color="purple", s=150, label="K' point")
+
+            plt.scatter(self.Kt[0], self.Kt[1], color="cyan", s=50, label="q2 point")
+            plt.scatter(self.Kb[0], self.Kb[1], color="magenta", s=50, label="q3 point")
+            plt.legend()
             ax.set_aspect("equal")
             plt.show()
+
+            # exit()
 
     def _build_tunneling_matrix(self, v):
 
@@ -175,37 +289,41 @@ class BMHamSetter:
 
         return hamv
 
+    def _build_tunnelling_matrix(self, v):
+        pass
+
     def h0(self, k, v):
-        H0 = np.array(
-            [[self.mass_term, 0], [0, -self.mass_term]], dtype=np.complex128
-        ) - self.hv * np.array(
+        H0 = -self.hv * np.array(
             [[0, v * k[0] - 1j * k[1]], [v * k[0] + 1j * k[1], 0]], dtype=np.complex128
         )
 
         return H0
 
     def ham(self, k, v):
-        from scipy.sparse import block_diag
-
+        if v == -1:
+            T = self.hamn
+            Ct = self.ctn
+            Cb = self.cbn
+        else:
+            T = self.hamp
+            Ct = self.ctp
+            Cb = self.cbp
         block = []
 
         for i in range(len(self.Gmesh)):
-            H0 = self.h0(self.preft.dot(k + self.Gmesh[i] - v * self.Kt), v)
-            H1 = self.h0(self.prefb.dot(k + self.Gmesh[i] - v * self.Kb), v)
+            H0 = self.h0(self.preft.dot(k + self.Gmesh[i] - v * self.Kt), v) + Ct
+            H1 = self.h0(self.prefb.dot(k + self.Gmesh[i] - v * self.Kb), v) + Cb
             block.append(H0)
             block.append(H1)
         H = block_diag(block).toarray()
-        if v == -1:
-            H += self.hamn
-        else:
-            H += self.hamp
+        H = H + T
         return H
 
     def set_uni(self, eh, phi):
         nv = 0.16
 
         eh = eh / 100
-        phi = np.rad2deg(phi)
+        phi = np.deg2rad(phi)
 
         exx = eh * (np.cos(phi) ** 2 - nv * np.sin(phi) ** 2)
         eyy = eh * (np.sin(phi) ** 2 - nv * np.cos(phi) ** 2)
@@ -223,7 +341,7 @@ class BMHamSetter:
 
     def set_shear(self, eh, phi):
         eh = eh / 100
-        phi = np.rad2deg(phi)
+        phi = np.deg2rad(phi)
 
         exx = -eh * np.sin(2 * phi)
         eyy = eh * np.sin(2 * phi)
@@ -266,14 +384,14 @@ class BMHamSetter:
 
 if __name__ == "__main__":
 
-    ham = BMHamSetter(trad=np.deg2rad(1.05))
+    ham = BMHamSetter(trad=np.deg2rad(1.05), eh=0, phi=0)
     eigs, kidx = ham.calc_band(v=-1, knum=200)
     eigs = np.array(eigs).T
     plt.figure(figsize=(6, 4))
     for i in range(eigs.shape[0]):
         plt.plot(eigs[i], color="black", lw=1)
     plt.xlim(0, 200)
-    plt.ylim(-0.1, 0.1)
+    plt.ylim(-0.075, 0.075)
     plt.xticks(kidx, [r"$\Gamma$", "M", "K", r"$\Gamma$", "K'"])
     plt.ylabel("Energy (eV)")
     plt.title("Twisted Bilayer Graphene Band Structure")

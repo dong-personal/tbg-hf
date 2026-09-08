@@ -456,7 +456,7 @@ class HFHamSetter(BMHamSetter):
 
         H = H.reshape(self.Nk * self.Nk, self.ntotal, self.ntotal)
         F = F.reshape(self.Nk * self.Nk, self.ntotal, self.ntotal)
-        ham = self.K + H
+        ham = self.K + H + F
 
         if self.test:
             print(
