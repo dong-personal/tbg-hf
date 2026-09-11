@@ -536,7 +536,7 @@ class HFHamSetter(BMHamSetter):
         # # [kx, ky, n, G, l, \sigma]
         phiG = eigvecs.reshape(self.Nk, self.Nk, self.Nb, self.NG, 2, 2)
 
-        # # bug to be fixed
+        # # # bug to be fixed
         # phiGC2T = np.conj(
         #     phiG[:, :, :, :, :, ::-1]
         # )  # [kx, ky, n, G, l, \sigma] -> [kx, ky, n, G, l, \sigma] with layer flipped and complex conjugated
@@ -552,8 +552,6 @@ class HFHamSetter(BMHamSetter):
         # )  # [kx, ky, n, G, l, \sigma]
 
         phiG = phiG.reshape(self.Nk * self.Nk, self.Nb, self.NG, 4)  # [k, n, G, lσ]
-
-        print("test:", np.max(np.abs(phiG)))
 
         # self.phiG = phiG
 
@@ -826,27 +824,21 @@ class HFHamSetter(BMHamSetter):
             dm[:, :, :, 0, :, :, 0] = dm_K_avg
             dm[:, :, :, 1, :, :, 1] = dm_K_avg
 
-        # dm[:, :, 0, :, :, 1, :] = 0
-        # dm[:, :, 1, :, :, 0, :] = 0
-
-        # dm[:, :, :, 0, :, :, 1] = 0
-        # dm[:, :, :, 1, :, :, 0] = 0
-
         dm = dm.reshape(self.Nk * self.Nk, self.ntotal, self.ntotal)
 
         return dm, fermi_energy
 
     def scf(self, filling):
-        # dm = random_density_matrix(
-        #     self.Nk * self.Nk,
-        #     self.Nb,
-        #     filling,
-        #     self.spin_coherence,
-        #     self.valley_coherence,
-        #     seed=20260911,
-        # )
+        dm = random_density_matrix(
+            self.Nk * self.Nk,
+            self.Nb,
+            filling,
+            self.spin_coherence,
+            self.valley_coherence,
+            seed=20260911,
+        )
 
-        dm = init_c2ti(self.Nk * self.Nk, sign=1)
+        # dm = init_c2ti(self.Nk * self.Nk, sign=1)
 
         # dm = init_fmi_valley(self.Nk * self.Nk, valley=0)
 
@@ -896,8 +888,8 @@ class HFHamSetter(BMHamSetter):
         dmdiff = nextdmk - dmk
         hamdiff = nexthamk - hamk
 
-        s = 2 * contract("kij,kij->", hamk, dmdiff)
-        c = contract("kij,kij->", hamdiff, dmdiff)
+        s = 2 * contract("kij,kij->", hamk, dmdiff.conj())
+        c = contract("kij,kij->", hamdiff, dmdiff.conj())
 
         lambda_opt = -s / (2 * c) if c > -s / 2 else 1.0
 
@@ -914,16 +906,28 @@ class HFHamSetter(BMHamSetter):
 
     def total_energy(self, dm):
         ham = self.hamhf(dm)
-        energy = contract("kij,kij->", self.K + ham, dm) / 2
+        energy = contract("kij,kij->", self.K + ham, dm.conj()) / 2
         return energy / (self.Nk * self.Nk)
 
 
 if __name__ == "__main__":
-    hf = HFHamSetter(test=False)
+    ENV.redirect_output()
+    hf = HFHamSetter(
+        test=False,
+        cutoff=6,
+        Nk=24,
+        spin_coherence=True,
+        valley_coherence=True,
+        max_iter=200,
+    )
     dm, eigs, states, fermi = hf.scf(filling=0)
 
     ivc = hf.IVC(dm)
     print("IVC:", ivc)
+
+    total_energy = np.abs(hf.total_energy(dm))
+    print("Total energy:", total_energy)
+
     # eigs [k,nsv]
     fig, ax = plt.subplots(figsize=(8, 6))
 
@@ -945,4 +949,4 @@ if __name__ == "__main__":
     ax.tick_params(direction="in", axis="y")
     plt.ylim(-0.05, 0.05)
     plt.ylabel("Energy (eV)")
-    plt.show()
+    plt.savefig("eigs.png", dpi=300, bbox_inches="tight")
