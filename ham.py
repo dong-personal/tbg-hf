@@ -80,13 +80,13 @@ def fold(kpoints, b1, b2, N=4):
 
 @dataclass
 class BMHamSetter:
-    trad: float = np.deg2rad(1.05)
+    trad: float = np.deg2rad(1.086)
     dcc: float = 0.142
-    hv: float = 2.15 * np.sqrt(3) * dcc * 1
-    gammaAA: float = 0.1
-    gammaAB: float = 0.1
+    hv: float = 2.365 * np.sqrt(3) * dcc * 1
+    gammaAA: float = 0.08
+    gammaAB: float = 0.11
     a: float = 0.246
-    cutoff: int = 4
+    cutoff: int = 6
     mass_term: float = 0.0
 
     # strain
@@ -178,9 +178,6 @@ class BMHamSetter:
 
         self.KT = fold(KT, self.G[0], self.G[1], N=4)
         self.KB = fold(KB, self.G[0], self.G[1], N=4)
-
-        # self.KT = np.dot(fracT, self.G)
-        # self.KB = np.dot(fracB, self.G)
 
         q1 = (self.G[0] - self.G[1]) / 3.0
         q2 = q1 + self.G[1]

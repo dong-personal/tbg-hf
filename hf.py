@@ -6,15 +6,368 @@ from ham import BMHamSetter
 from scipy.spatial import KDTree
 from opt_einsum import contract
 
-from scipy.stats import unitary_group
-import random
 from collections import namedtuple
+import numpy as np
+
+from mpi import ENV
+
+
+def haar_unitary(N, rng):
+    """Generate a Haar-random U(N) matrix."""
+    z = rng.normal(size=(N, N)) + 1j * rng.normal(size=(N, N))
+
+    q, r = np.linalg.qr(z)
+
+    d = np.diag(r)
+    phase = d / np.abs(d)
+
+    return q @ np.diag(np.conj(phase))
+
+
+def random_density_block(dim, occupation, rng):
+    """
+    Generate a random Hermitian density matrix with
+
+        Tr(P) = occupation
+        0 <= eigenvalues <= 1
+
+    If occupation is integer, P is a projector:
+        P^2 = P.
+
+    If occupation is fractional, one eigenvalue is fractional.
+    """
+
+    if occupation < -1e-12 or occupation > dim + 1e-12:
+        raise ValueError(f"occupation={occupation} outside [0, {dim}]")
+
+    U = haar_unitary(dim, rng)
+
+    occ = np.zeros(dim)
+
+    n_full = int(np.floor(occupation + 1e-12))
+    frac = occupation - n_full
+
+    if n_full > 0:
+        occ[:n_full] = 1.0
+
+    if frac > 1e-12:
+        occ[n_full] = frac
+
+    # U diag(occ) U^\dagger
+    return (U * occ) @ U.conj().T
+
+
+def random_density_matrix(
+    Nk,
+    Nn,
+    filling=0,
+    allow_spin_coherence=True,
+    allow_valley_coherence=True,
+    seed=None,
+):
+    """
+    Generate random density matrix in basis
+
+        |k, n, s, v>
+
+    Array convention:
+
+        P[k, n, s, v, n', s', v']
+
+      = < c^\dagger_{k,n',s',v'}
+          c_{k,n,s,v} >
+
+    Parameters
+    ----------
+    Nk : int
+        Number of k points.
+
+    Nn : int
+        Number of active bands per spin/valley.
+
+    filling : float
+        Filling relative to charge neutrality.
+
+        Total occupation per k:
+
+            Nocc = 2*Nn + filling
+
+        For Nn=2:
+            filling = -4 ... +4
+
+    allow_spin_coherence : bool
+        True:
+            spin coherence/polarization are allowed.
+
+        False:
+            spin coherence forbidden:
+                P_{up,down} = 0
+
+            AND spin polarization forbidden:
+                P_{up,up} = P_{down,down}.
+
+    allow_valley_coherence : bool
+        True:
+            valley coherence/polarization are allowed.
+
+        False:
+            valley coherence forbidden:
+                P_{K,K'} = 0
+
+            AND valley polarization forbidden:
+                P_{K,K} = P_{K',K'}.
+
+    seed : int or None
+        Random seed.
+
+    Returns
+    -------
+    P : ndarray
+        Shape:
+
+        (Nk, Nn, 2, 2, Nn, 2, 2)
+
+        corresponding to
+
+        (k,n,s,v,n',s',v')
+    """
+
+    rng = np.random.default_rng(seed)
+
+    Ns = 2
+    Nv = 2
+
+    D = Nn * Ns * Nv
+
+    # neutrality = half filling
+    Nocc = 2 * Nn + filling
+
+    if Nocc < 0 or Nocc > D:
+        raise ValueError(f"filling must satisfy " f"{-2*Nn} <= filling <= {2*Nn}")
+
+    P = np.zeros(
+        (Nk, Nn, Ns, Nv, Nn, Ns, Nv),
+        dtype=complex,
+    )
+
+    # =====================================================
+    # Case 1
+    # Spin coherence allowed
+    # Valley coherence allowed
+    #
+    # Full random density matrix in (n,s,v)
+    # =====================================================
+    if allow_spin_coherence and allow_valley_coherence:
+
+        for k in range(Nk):
+
+            Pblock = random_density_block(
+                D,
+                Nocc,
+                rng,
+            )
+
+            P[k] = Pblock.reshape(
+                Nn,
+                Ns,
+                Nv,
+                Nn,
+                Ns,
+                Nv,
+            )
+
+    # =====================================================
+    # Case 2
+    # Spin coherence FORBIDDEN
+    # Spin polarization FORBIDDEN
+    #
+    # Valley coherence allowed.
+    #
+    # Therefore:
+    #
+    # P_up = P_down
+    #
+    # Each spin block acts in (n,v).
+    # =====================================================
+    elif not allow_spin_coherence and allow_valley_coherence:
+
+        block_dim = Nn * Nv
+
+        # Two identical spin blocks
+        occupation_per_spin = Nocc / 2
+
+        for k in range(Nk):
+
+            Pblock = random_density_block(
+                block_dim,
+                occupation_per_spin,
+                rng,
+            )
+
+            Pblock = Pblock.reshape(
+                Nn,
+                Nv,
+                Nn,
+                Nv,
+            )
+
+            # SAME block for up and down
+            for s in range(Ns):
+                P[k, :, s, :, :, s, :] = Pblock
+
+    # =====================================================
+    # Case 3
+    # Valley coherence FORBIDDEN
+    # Valley polarization FORBIDDEN
+    #
+    # Spin coherence allowed.
+    #
+    # Therefore:
+    #
+    # P_K = P_K'
+    #
+    # Each valley block acts in (n,s).
+    # =====================================================
+    elif allow_spin_coherence and not allow_valley_coherence:
+
+        block_dim = Nn * Ns
+
+        # Two identical valley blocks
+        occupation_per_valley = Nocc / 2
+
+        for k in range(Nk):
+
+            Pblock = random_density_block(
+                block_dim,
+                occupation_per_valley,
+                rng,
+            )
+
+            Pblock = Pblock.reshape(
+                Nn,
+                Ns,
+                Nn,
+                Ns,
+            )
+
+            # SAME block for K and K'
+            for v in range(Nv):
+                P[k, :, :, v, :, :, v] = Pblock
+
+    # =====================================================
+    # Case 4
+    # Both spin and valley coherence FORBIDDEN
+    # Both spin and valley polarization FORBIDDEN
+    #
+    # All four (s,v) blocks must be identical.
+    #
+    # Only band space n remains random.
+    # =====================================================
+    else:
+
+        block_dim = Nn
+
+        # Four identical spin-valley blocks
+        occupation_per_flavor = Nocc / 4
+
+        for k in range(Nk):
+
+            Pblock = random_density_block(
+                block_dim,
+                occupation_per_flavor,
+                rng,
+            )
+
+            for s in range(Ns):
+                for v in range(Nv):
+
+                    P[k, :, s, v, :, s, v] = Pblock
+
+    P = P.reshape(Nk, Nn * Ns * Nv, Nn * Ns * Nv)
+
+    P = np.transpose(P, (0, 2, 1))
+
+    return P
+
+
+def init_fmi_valley(
+    Nk,
+    valley=0,
+):
+    """
+    Valley-polarized FMI at filling = 0. valley = 0 or 1
+    """
+    Nn = 2
+    Ns = 2
+    Nv = 2
+
+    rho = np.zeros(
+        (Nk, Nn, Ns, Nv, Nn, Ns, Nv),
+        dtype=complex,
+    )
+
+    # Fill both bands and both spins
+    # in one valley.
+    for k in range(Nk):
+        for n in range(Nn):
+            for s in range(Ns):
+
+                rho[k, n, s, valley, n, s, valley] = 1.0
+
+    rho = rho.reshape(Nk, Nn * Ns * Nv, Nn * Ns * Nv)
+
+    return rho
+
+
+def init_c2ti(
+    Nk,
+    sign=1,
+):
+    """
+    C2T-breaking initial state at filling = 0.
+    sign = +1:
+        occupy gamma_x = +1 eigenstate
+
+    sign = -1:
+        occupy gamma_x = -1 eigenstate
+    """
+
+    Nn = 2
+    Ns = 2
+    Nv = 2
+
+    rho = np.zeros(
+        (Nk, Nn, Ns, Nv, Nn, Ns, Nv),
+        dtype=complex,
+    )
+
+    gamma0 = np.eye(2, dtype=complex)
+
+    gammax = np.array(
+        [
+            [0.0, 1.0],
+            [1.0, 0.0],
+        ],
+        dtype=complex,
+    )
+
+    # Rank-1 band projector
+    Pband = 0.5 * (gamma0 + sign * gammax)
+
+    for k in range(Nk):
+        for s in range(Ns):
+            for v in range(Nv):
+
+                rho[k, :, s, v, :, s, v] = Pband
+
+    rho = rho.reshape(Nk, Nn * Ns * Nv, Nn * Ns * Nv)
+    return rho
 
 
 @dataclass
 class HFHamSetter(BMHamSetter):
 
-    Nk: int = 12
+    Nk: int = 18
     dsc: float = 40
 
     efac: float = 9.0279  # e^2 / 2\epsilon_0
@@ -22,11 +375,18 @@ class HFHamSetter(BMHamSetter):
     prefH = 1 / (4 * np.pi**2)
     prefF = prefH / 1
 
-    epsilon: float = 10
+    epsilon: float = 7
 
-    max_iter: int = 40
+    max_iter: int = 200
 
-    mix = 0.2
+    mix: float = 0.2
+
+    useoda: int = 1
+
+    spin_coherence: bool = False
+    valley_coherence: bool = False
+    coulomb_type: int = 2
+    ref_type: int = 2
 
     def __post_init__(self):
         super().__post_init__()
@@ -45,13 +405,20 @@ class HFHamSetter(BMHamSetter):
 
         self.dmref = np.zeros(
             (self.Nk * self.Nk, self.ntotal, self.ntotal), dtype=np.complex128
-        )  # .reshape(self.Nk * self.Nk, self.Nb, 2, 2, self.Nb, 2, 2)
-        for k in range(self.Nk * self.Nk):
-            self.dmref[k] = np.eye(self.ntotal, dtype=np.complex128) * 0.5
-        #     for s in range(2):
-        #         for v in range(2):
-        #             self.dmref[k, 0 : self.Nb // 2, s, v, 0 : self.Nb // 2, s, v] = 1
-        # self.dmref = self.dmref.reshape(self.Nk * self.Nk, self.ntotal, self.ntotal)
+        )
+        if self.ref_type == 1:
+            for k in range(self.Nk * self.Nk):
+                self.dmref[k] = np.eye(self.ntotal, dtype=np.complex128) * 0.5
+        elif self.ref_type == 2:
+            self.dmref = self.dmref.reshape(
+                self.Nk * self.Nk, self.Nb, 2, 2, self.Nb, 2, 2
+            )
+
+            for s in range(2):
+                for v in range(2):
+                    self.dmref[:, 0 : self.Nb // 2, s, v, 0 : self.Nb // 2, s, v] = 1
+
+            self.dmref = self.dmref.reshape(self.Nk * self.Nk, self.ntotal, self.ntotal)
 
     def _build_kmesh(self):
         Nx, Ny = np.meshgrid(np.arange(self.Nk), np.arange(self.Nk), indexing="ij")
@@ -94,6 +461,13 @@ class HFHamSetter(BMHamSetter):
             * np.linspace(0, self.Nk, self.Nk // 6 + 1)[:, np.newaxis]
         ) + np.array([1, 1]) / 2
 
+        MKp = (
+            np.array([-1, 1])
+            / 6
+            / self.Nk
+            * np.linspace(0, self.Nk, self.Nk // 6 + 1)[:, np.newaxis]
+        ) + np.array([1, 1]) / 2
+
         # G -> M : Nk/2
         # G -> K : Nk/3
         # M -> K : Nk/6
@@ -112,11 +486,13 @@ class HFHamSetter(BMHamSetter):
             )
             return KPATH(kidx, kpathnorm, matched_indices)
 
-        # G -> K -> M -> G
-
+        # G -> K -> K' -> G
         kpath1 = concat(GK, KKp[1:], GKp[-2::-1])
 
-        self.kpath = kpath1
+        # K-> G -> M -> K'
+        kpath2 = concat(GK[::-1], GM[1:], MKp[1:])
+
+        self.kpath = kpath2
 
         if self.test:
             fig, ax = plt.subplots(figsize=(6, 6))
@@ -133,35 +509,47 @@ class HFHamSetter(BMHamSetter):
             plt.show()
 
     def solve_spresults(self, v=1):
-        eigs, eigvecs = [], []
-        eigsp, eigvecsp = [], []
-        for k in self.kmesh:
+
+        def f(k):
             eig, vec = np.linalg.eigh(self.ham(k, v))
-            vec = vec.T
-            eigs.append(eig)
-            eigvecs.append(vec)
-        # [k, n]
+            return eig[self.active_band], vec.T[self.active_band, :]
+
+        results = ENV.map(f, self.kmesh)
+        results = ENV.allgather(results)
+        eigs, eigvecs = zip(*results)
+
         eigs = np.array(eigs)
-        # [k, n, Glσ] first index is k, second index is band, third index is G l \sigma
-        eigvecs = np.array(eigvecs)[:, self.active_band, :]
+        eigvecs = np.array(eigvecs)
+
+        # eigs, eigvecs = [], []
+        # eigsp, eigvecsp = [], []
+        # for k in self.kmesh:
+        #     eig, vec = np.linalg.eigh(self.ham(k, v))
+        #     vec = vec.T
+        #     eigs.append(eig)
+        #     eigvecs.append(vec)
+        # # [k, n]
+        # eigs = np.array(eigs)
+        # # [k, n, Glσ] first index is k, second index is band, third index is G l \sigma
+        # eigvecs = np.array(eigvecs)[:, self.active_band, :]
 
         # # [kx, ky, n, G, l, \sigma]
         phiG = eigvecs.reshape(self.Nk, self.Nk, self.Nb, self.NG, 2, 2)
 
-        # bug to be fixed
-        phiGC2T = np.conj(
-            phiG[:, :, :, :, :, ::-1]
-        )  # [kx, ky, n, G, l, \sigma] -> [kx, ky, n, G, l, \sigma] with layer flipped and complex conjugated
+        # # bug to be fixed
+        # phiGC2T = np.conj(
+        #     phiG[:, :, :, :, :, ::-1]
+        # )  # [kx, ky, n, G, l, \sigma] -> [kx, ky, n, G, l, \sigma] with layer flipped and complex conjugated
 
-        UC2T = np.einsum(
-            "xyngls,xymgls->xynm", np.conj(phiG), phiGC2T
-        )  # [kx, ky, n, m]
+        # UC2T = np.einsum(
+        #     "xyngls,xymgls->xynm", np.conj(phiG), phiGC2T
+        # )  # [kx, ky, n, m]
 
-        phase = -np.angle(np.diagonal(UC2T, axis1=2, axis2=3))  # [kx, ky, n]
+        # phase = -np.angle(np.diagonal(UC2T, axis1=2, axis2=3))  # [kx, ky, n]
 
-        phiG = phiG * np.exp(
-            -0.5j * phase[:, :, :, np.newaxis, np.newaxis, np.newaxis]
-        )  # [kx, ky, n, G, l, \sigma]
+        # phiG = phiG * np.exp(
+        #     -0.5j * phase[:, :, :, np.newaxis, np.newaxis, np.newaxis]
+        # )  # [kx, ky, n, G, l, \sigma]
 
         phiG = phiG.reshape(self.Nk * self.Nk, self.Nb, self.NG, 4)  # [k, n, G, lσ]
 
@@ -195,7 +583,6 @@ class HFHamSetter(BMHamSetter):
 
             print("matched_indices", matched_indices)
 
-        print("test:", np.max(np.abs(phiGp)))
         self.phiG = phiG.transpose(1, 0, 3, 2)  # [n, k, lσ, G]
         self.phiGp = phiGp.transpose(1, 0, 3, 2)  # [n, k, lσ, G]
 
@@ -214,8 +601,8 @@ class HFHamSetter(BMHamSetter):
         eigsp[midx, :] = eigs[idx, :]
 
         # [k, n]
-        self.eigs = eigs[:, self.active_band]
-        self.eigsp = eigsp[:, self.active_band]
+        self.eigs = eigs
+        self.eigsp = eigsp
 
         if self.test:
             fig, ax = plt.subplots(figsize=(6, 8))
@@ -242,95 +629,6 @@ class HFHamSetter(BMHamSetter):
             for i in self.kpath.kidx:
                 ax.axvline(x=self.kpath.kpathnorm[i], color="k", linestyle="--")
             plt.show()
-
-    @staticmethod
-    def _random_unitary(n, rng):
-        z = rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))
-        q, r = np.linalg.qr(z)
-        phase = np.diag(r)
-        phase = np.where(np.abs(phase) > 0, phase / np.abs(phase), 1.0)
-        return q * phase.conj()
-
-    def initial_federico(self, filling):
-
-        lenlistP = self.Nk * self.Nk
-
-        Nst = int((filling + 4 * self.Nb // 2) * lenlistP)
-
-        U = np.zeros((8, 8, lenlistP), dtype=np.complex128)
-
-        count = 0
-
-        while count < Nst:
-            for a in range(8):  # run over all HF bands
-
-                jr = random.randint(0, lenlistP - 1)
-
-                if np.all(U[:, a, jr]) == 0:
-                    U[:, a, jr] = unitary_group.rvs(8)[0]
-                    count += 1
-
-        " Order Parameter "
-
-        op = np.einsum("iak, jak -> kij", np.conj(U), U)
-
-        # make zero the off diagonal spin components
-        op[:, 4:8, 0:4], op[:, 0:4, 4:8] = 0, 0
-
-        # make zero intervalley terms
-
-        op[:, 2:8, 0:2], op[:, 0:2, 2:8] = 0, 0
-        op[:, 4:8, 2:4], op[:, 2:4, 4:8] = 0, 0
-        op[:, 6:8, 4:6], op[:, 4:6, 6:8] = 0, 0
-
-        op = op.reshape(self.Nk * self.Nk, 2, 2, 2, 2, 2, 2)
-
-        op = op.transpose(0, 3, 1, 2, 6, 4, 5)
-
-        op = op.reshape(self.Nk * self.Nk, self.ntotal, self.ntotal)
-        return op
-
-    def initial_random(self, filling, seed=None):
-        """Build a random block-diagonal initial density matrix for HF iteration.
-
-        The flattened single-particle index is interpreted as ``(band, spin, valley)``,
-        matching ``hamhf`` and ``getdm`` in ``hf.py``.
-        """
-        rng = np.random.default_rng(seed)
-
-        nk_total = self.Nk * self.Nk
-        n_occ = self.ntotal // 2 + int(filling)
-        if not 0 <= n_occ <= self.ntotal:
-            raise ValueError(f"filling={filling} gives invalid n_occ={n_occ}")
-
-        dm = np.zeros(
-            (nk_total, self.Nb, 2, 2, self.Nb, 2, 2),
-            dtype=np.complex128,
-        )
-
-        base_occ = np.full((2, 2), n_occ // 4, dtype=int)
-        remainder = n_occ - int(base_occ.sum())
-
-        for k in range(nk_total):
-            occ = base_occ.copy()
-            if remainder > 0:
-                choices = rng.choice(4, size=remainder, replace=False)
-                for choice in choices:
-                    s, v = divmod(int(choice), 2)
-                    occ[s, v] += 1
-
-            for s in range(2):
-                for v in range(2):
-                    m = int(occ[s, v])
-                    if m == 0:
-                        continue
-
-                    u = self._random_unitary(self.Nb, rng)
-                    occupied = u[:, :m].T
-                    rho = np.einsum("ai,aj->ij", occupied.conj(), occupied)
-                    dm[k, :, s, v, :, s, v] = rho
-
-        return dm.reshape(nk_total, self.ntotal, self.ntotal)
 
     def _build_form_factor(self):
 
@@ -383,6 +681,42 @@ class HFHamSetter(BMHamSetter):
 
         self.K = h0
 
+    def screened_coulomb(self, q, type=1):
+        norm = np.linalg.norm(q, axis=-1)
+        zero_mask = norm < 1e-10
+        if type == 1:
+            # [k, p, Q]
+            VcF = (
+                self.efac
+                * np.tanh(self.dsc * norm)
+                / np.where(norm > 1e-10, norm, 1e-10)
+                / self.epsilon
+                * self.dk2
+                / (4 * np.pi**2)
+            )
+            VcF[zero_mask] = (
+                self.efac * self.dsc / self.epsilon * self.dk2 / (4 * np.pi**2)
+            )
+
+        elif type == 2:
+            VcF = (
+                self.efac
+                * (1 - np.exp(-2 * self.dsc * norm))
+                / (np.where(norm > 1e-10, norm, 1e-10))
+                / self.epsilon
+                * self.dk2
+                / (4 * np.pi**2)
+            )
+            # VcF[zero_mask] = (
+            #     self.efac * 2 * self.dsc / self.epsilon * self.dk2 / (4 * np.pi**2)
+            # )
+
+        VcG = np.copy(VcF[0, 0])
+        Gnorm = np.linalg.norm(self.Gmesh, axis=-1)
+        Gzero_mask = Gnorm < 1e-10
+        VcG[Gzero_mask] = 0.0
+        return VcF, VcG
+
     def _build_hf(self):
         # [v, n, n', k, k', G]
         form_factors = self._build_form_factor()
@@ -394,38 +728,15 @@ class HFHamSetter(BMHamSetter):
             + self.kmesh[np.newaxis, :, np.newaxis, :]
             + self.Gmesh[np.newaxis, np.newaxis, :, :]
         )
-        norm = np.linalg.norm(kminuskpminusG, axis=-1)
-
-        zero_mask = norm < 1e-10
 
         # [k, p, Q]
-        VcF = (
-            self.efac
-            * np.tanh(self.dsc * norm)
-            / np.where(norm > 1e-10, norm, 1e-10)
-            / self.epsilon
-            * self.dk2
-            / (4 * np.pi**2)
-        )
-        VcF[zero_mask] = self.efac * self.dsc / self.epsilon * self.dk2 / (4 * np.pi**2)
-
-        VcG = VcF[0, 0]
-        Gnorm = np.linalg.norm(self.Gmesh, axis=-1)
-        Gzero_mask = Gnorm < 1e-10
-        VcG[Gzero_mask] = 0.0
+        VcF, VcG = self.screened_coulomb(kminuskpminusG, type=self.coulomb_type)
 
         # n1 -> m, n2 -> n, n3 -> r, n4 -> s
         self.VH = contract("q, vmrkkq, Vsnppq->kpmnvrsV", VcG, form_factors, conj)
 
         # D rn C ms
         self.VF = contract("kpq, vmrkpq, Vsnkpq->kpmnvrsV", VcF, form_factors, conj)
-
-        # VH = VH.transpose(0, 2, 3, 4, 1, 5, 6, 7)
-        # VF = VF.transpose(0, 2, 3, 4, 7, 1, 5, 6)
-
-        # VH = VH.reshape(self.Nk * self.Nk * 2 * 2 * 2, self.Nk * self.Nk * 2 * 2 * 2)
-
-        # VF = VF.reshape(self.Nk * self.Nk * 2 * 2, 2 * 2, self.Nk * self.Nk * 2 * 2)
 
     def hamhf(self, dm):
         # dm: [k, nsv, n's'v']
@@ -458,14 +769,17 @@ class HFHamSetter(BMHamSetter):
         F = F.reshape(self.Nk * self.Nk, self.ntotal, self.ntotal)
         ham = self.K + H + F
 
-        if self.test:
-            print(
-                "Hermitian error:", np.max(np.abs(ham - ham.conj().transpose(0, 2, 1)))
-            )
+        # if self.test:
+        #     print(
+        #         "Hermitian error:", np.max(np.abs(ham - ham.conj().transpose(0, 2, 1)))
+        #     )
 
         return ham
 
     def getdm(self, eigs, states, filling):
+        # here we define density matrix as Dij=<ci^dagger cj> = sum_{occupied n} <i|n><n|j>
+        # in some paper Dji=<ci^dagger cj>
+        # for the defination <A>=Tr(AD^T)
 
         eigs = np.array(eigs).flatten()
 
@@ -488,52 +802,130 @@ class HFHamSetter(BMHamSetter):
 
         dm = dm.reshape(self.Nk * self.Nk, self.Nb, 2, 2, self.Nb, 2, 2)
 
-        dm[:, :, 0, :, :, 1, :] = 0
-        dm[:, :, 1, :, :, 0, :] = 0
+        if not self.spin_coherence:
+            dm[:, :, 0, :, :, 1, :] = 0
+            dm[:, :, 1, :, :, 0, :] = 0
 
-        dm[:, :, :, 0, :, :, 1] = 0
-        dm[:, :, :, 1, :, :, 0] = 0
+            dm_up = dm[:, :, 0, :, :, 0, :]
+            dm_down = dm[:, :, 1, :, :, 1, :]
+
+            dm_spin_avg = 0.5 * (dm_up + dm_down)
+
+            dm[:, :, 0, :, :, 0, :] = dm_spin_avg
+            dm[:, :, 1, :, :, 1, :] = dm_spin_avg
+
+        if not self.valley_coherence:
+            dm[:, :, :, 0, :, :, 1] = 0
+            dm[:, :, :, 1, :, :, 0] = 0
+
+            dm_K = dm[:, :, :, 0, :, :, 0]
+            dm_Kp = dm[:, :, :, 1, :, :, 1]
+
+            dm_K_avg = 0.5 * (dm_K + dm_Kp)
+
+            dm[:, :, :, 0, :, :, 0] = dm_K_avg
+            dm[:, :, :, 1, :, :, 1] = dm_K_avg
+
+        # dm[:, :, 0, :, :, 1, :] = 0
+        # dm[:, :, 1, :, :, 0, :] = 0
+
+        # dm[:, :, :, 0, :, :, 1] = 0
+        # dm[:, :, :, 1, :, :, 0] = 0
 
         dm = dm.reshape(self.Nk * self.Nk, self.ntotal, self.ntotal)
 
         return dm, fermi_energy
 
     def scf(self, filling):
-        dm = self.initial_federico(filling)
+        # dm = random_density_matrix(
+        #     self.Nk * self.Nk,
+        #     self.Nb,
+        #     filling,
+        #     self.spin_coherence,
+        #     self.valley_coherence,
+        #     seed=20260911,
+        # )
+
+        dm = init_c2ti(self.Nk * self.Nk, sign=1)
+
+        # dm = init_fmi_valley(self.Nk * self.Nk, valley=0)
+
         step = 0
+
         while True:
             ham = self.hamhf(dm)
-            states = []
-            eigs = []
-            for k in range(self.Nk * self.Nk):
-                eig, vec = np.linalg.eigh(ham[k])
-                states.append(vec.T)
-                eigs.append(eig)
-            states = np.array(states)
 
-            # simple mixing
+            def f(k):
+                eig, vec = np.linalg.eigh(ham[k])
+                return eig, vec.T
+
+            results = ENV.map(f, list(range(self.Nk * self.Nk)))
+            results = ENV.allgather(results)
+
+            eigs, states = zip(*results)
+            # states = []
+            # eigs = []
+            # for k in range(self.Nk * self.Nk):
+            #     eig, vec = np.linalg.eigh(ham[k])
+            #     states.append(vec.T)
+            #     eigs.append(eig)
+            # states = np.array(states)
+
             dm_new, fermi_energy = self.getdm(eigs, states, filling)
 
-            dm_new = dm_new * self.mix + (1 - self.mix) * dm
+            # oda
+            if self.useoda:
+                next_ham = self.hamhf(dm_new)
+                dm_new = self.oda(ham, next_ham, dm, dm_new)
+            # simple mixing
+            else:
+                dm_new = dm_new * self.mix + (1 - self.mix) * dm
 
             error = np.max(np.abs(dm_new - dm))
             step += 1
 
             print("step:", step, "error:", error)
-
+            dm = dm_new
             if error < 1e-6 or step >= self.max_iter:
                 break
 
-            dm = dm_new
+        return dm, np.array(eigs), np.array(states), fermi_energy
 
-        return np.array(eigs), np.array(states), fermi_energy
+    # optimal damping algorithm (ODA) for mixing
+    def oda(self, hamk, nexthamk, dmk, nextdmk):
+        dmdiff = nextdmk - dmk
+        hamdiff = nexthamk - hamk
+
+        s = 2 * contract("kij,kij->", hamk, dmdiff)
+        c = contract("kij,kij->", hamdiff, dmdiff)
+
+        lambda_opt = -s / (2 * c) if c > -s / 2 else 1.0
+
+        return lambda_opt * nextdmk + (1 - lambda_opt) * dmk
+
+    def IVC(self, dm):
+
+        dm = dm.reshape(self.Nk * self.Nk, self.Nb, 2, 2, self.Nb, 2, 2)
+
+        r = np.abs(dm[:, :, :, 0, :, :, 1]) ** 2 + np.abs(dm[:, :, :, 1, :, :, 0]) ** 2
+
+        r = 1 / (self.Nk * self.Nk * 2) * np.sum(r)
+        return r
+
+    def total_energy(self, dm):
+        ham = self.hamhf(dm)
+        energy = contract("kij,kij->", self.K + ham, dm) / 2
+        return energy / (self.Nk * self.Nk)
 
 
 if __name__ == "__main__":
-    hf = HFHamSetter()
-    eigs, states, fermi = hf.scf(filling=-1)
+    hf = HFHamSetter(test=False)
+    dm, eigs, states, fermi = hf.scf(filling=0)
+
+    ivc = hf.IVC(dm)
+    print("IVC:", ivc)
     # eigs [k,nsv]
-    fig, ax = plt.subplots(figsize=(6, 8))
+    fig, ax = plt.subplots(figsize=(8, 6))
 
     for i in range(eigs.shape[1]):
         plt.plot(hf.kpath.kpathnorm, eigs[hf.kpath.matched_indices, i], color="r", lw=2)
@@ -541,11 +933,16 @@ if __name__ == "__main__":
     plt.xlim(0, hf.kpath.kpathnorm[-1])
     plt.xticks(
         [hf.kpath.kpathnorm[i] for i in hf.kpath.kidx],
-        ["G", "K", "K'", "G"],
+        # ["G", "K", "K'", "G"],
+        ["K", "G", "M", "K'"],
     )
+
     plt.axhline(y=fermi, color="b", lw=2, ls="--", label="Fermi energy")
     for i in hf.kpath.kidx:
         ax.axvline(x=hf.kpath.kpathnorm[i], color="k", linestyle="--")
-
+    plt.yticks((-0.04, -0.02, 0, 0.02, 0.04))
+    plt.yticks((-0.03, -0.01, 0.01, 0.03), minor=True)
+    ax.tick_params(direction="in", axis="y")
+    plt.ylim(-0.05, 0.05)
     plt.ylabel("Energy (eV)")
     plt.show()
