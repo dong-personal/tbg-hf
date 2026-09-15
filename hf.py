@@ -9,7 +9,7 @@ from opt_einsum import contract
 from collections import namedtuple
 import numpy as np
 
-from mpi import ENV
+from solver.mpi import ENV
 
 
 def haar_unitary(N, rng):
@@ -364,6 +364,138 @@ def init_c2ti(
     return rho
 
 
+def init_ivc(
+    Nk,
+    sign=1,
+    valley_direction="x",
+):
+    """
+    IVC initial density matrix at filling = 0.
+
+    Basis:
+        |n, s, v>
+
+    n = band
+    s = spin
+    v = valley
+
+    Default order parameter:
+
+        gamma_y * s_0 * tau_x
+
+    corresponding to the spin-unpolarized IVC state.
+
+    Parameters
+    ----------
+    Nk : int
+        Total number of k points, i.e. self.Nk * self.Nk.
+
+    sign : +1 or -1
+        Choose the two opposite orientations of the IVC order.
+
+    valley_direction : "x" or "y"
+        "x":
+            gamma_y s_0 tau_x
+
+        "y":
+            gamma_y s_0 tau_y
+
+    Returns
+    -------
+    rho : ndarray
+        shape = (Nk, 8, 8)
+
+        Convention is the same as getdm():
+
+            rho_ij = <c_i^\dagger c_j>
+    """
+
+    Nn = 2
+    Ns = 2
+    Nv = 2
+
+    # ----------------------------------------
+    # Pauli matrices
+    # ----------------------------------------
+
+    gamma_y = np.array(
+        [
+            [0.0, -1.0j],
+            [1.0j, 0.0],
+        ],
+        dtype=np.complex128,
+    )
+
+    s0 = np.eye(
+        2,
+        dtype=np.complex128,
+    )
+
+    tau_x = np.array(
+        [
+            [0.0, 1.0],
+            [1.0, 0.0],
+        ],
+        dtype=np.complex128,
+    )
+
+    tau_y = np.array(
+        [
+            [0.0, -1.0j],
+            [1.0j, 0.0],
+        ],
+        dtype=np.complex128,
+    )
+
+    if valley_direction == "x":
+        tau = tau_x
+
+    elif valley_direction == "y":
+        tau = tau_y
+
+    else:
+        raise ValueError("valley_direction must be 'x' or 'y'")
+
+    # ----------------------------------------
+    # Basis ordering is:
+    #
+    #     band ⊗ spin ⊗ valley
+    #
+    # because your array is [n,s,v].
+    # ----------------------------------------
+
+    Oivc = np.kron(np.kron(gamma_y, s0), tau)
+
+    # ----------------------------------------
+    # Diagonalize the IVC order operator
+    #
+    # eigenvalues should be:
+    #
+    #     -1,-1,-1,-1,+1,+1,+1,+1
+    #
+    # At neutrality occupy four states.
+    # ----------------------------------------
+
+    eig, vec = np.linalg.eigh(Oivc)
+
+    if sign > 0:
+        occ = np.where(eig > 0)[0]
+    else:
+        occ = np.where(eig < 0)[0]
+
+    Uocc = vec[:, occ]
+
+    rho0 = Uocc.conj() @ Uocc.T
+
+    rho = np.repeat(
+        rho0[np.newaxis, :, :],
+        Nk,
+        axis=0,
+    )
+
+    return rho
+
+
 @dataclass
 class HFHamSetter(BMHamSetter):
 
@@ -385,6 +517,9 @@ class HFHamSetter(BMHamSetter):
 
     spin_coherence: bool = False
     valley_coherence: bool = False
+
+    spin_polarization: bool = False
+    valley_polarization: bool = False
     coulomb_type: int = 2
     ref_type: int = 2
 
@@ -399,7 +534,7 @@ class HFHamSetter(BMHamSetter):
         self.dk2 = self.Acr / self.Nk**2
 
         self.solve_spresults()
-        self._build_form_factor()
+        # self._build_form_factor()
         self._build_kinetic()
         self._build_hf()
 
@@ -418,6 +553,38 @@ class HFHamSetter(BMHamSetter):
                 for v in range(2):
                     self.dmref[:, 0 : self.Nb // 2, s, v, 0 : self.Nb // 2, s, v] = 1
 
+            self.dmref = self.dmref.reshape(self.Nk * self.Nk, self.ntotal, self.ntotal)
+
+        elif self.ref_type == 3:
+
+            # [k, n, v]
+            eigs = np.array((self.eigs, self.eigsp)).transpose(1, 2, 0)
+            sorted_indices = np.argsort(eigs.flatten())
+            occupied_num = 2 * self.Nb * self.Nk * self.Nk // 2
+            fermi_idx = sorted_indices[occupied_num - 1]
+            fermi = eigs.flatten()[fermi_idx]
+            deg_tol = 1e-8
+            below = np.where(eigs < fermi - deg_tol)
+            belownum = below[0].size
+
+            deg = np.where(np.abs(eigs - fermi) < deg_tol)
+
+            degnum = deg[0].size
+
+            self.dmref = self.dmref.reshape(
+                self.Nk * self.Nk, self.Nb, 2, 2, self.Nb, 2, 2
+            )
+
+            if degnum > 0:
+                frac = (occupied_num - belownum) / degnum
+                print("frac:", frac)
+            for s in range(2):
+                self.dmref[below[0], below[1], s, below[2], below[1], s, below[2]] = 1.0
+
+                if degnum > 0:
+                    self.dmref[deg[0], deg[1], s, deg[2], deg[1], s, deg[2]] = (
+                        occupied_num - belownum
+                    ) / degnum
             self.dmref = self.dmref.reshape(self.Nk * self.Nk, self.ntotal, self.ntotal)
 
     def _build_kmesh(self):
@@ -510,97 +677,187 @@ class HFHamSetter(BMHamSetter):
 
     def solve_spresults(self, v=1):
 
-        def f(k):
-            eig, vec = np.linalg.eigh(self.ham(k, v))
-            return eig[self.active_band], vec.T[self.active_band, :]
+        def solve(v):
 
-        results = ENV.map(f, self.kmesh)
-        results = ENV.allgather(results)
-        eigs, eigvecs = zip(*results)
+            def f(k):
+                eig, vec = np.linalg.eigh(self.ham(k, v))
+                return eig[self.active_band], vec.T[self.active_band, :]
 
-        eigs = np.array(eigs)
-        eigvecs = np.array(eigvecs)
+            results = ENV.map(f, self.kmesh)
+            results = ENV.allgather(results)
+            eigs, eigvecs = zip(*results)
 
-        # eigs, eigvecs = [], []
-        # eigsp, eigvecsp = [], []
-        # for k in self.kmesh:
-        #     eig, vec = np.linalg.eigh(self.ham(k, v))
-        #     vec = vec.T
-        #     eigs.append(eig)
-        #     eigvecs.append(vec)
-        # # [k, n]
-        # eigs = np.array(eigs)
-        # # [k, n, Glσ] first index is k, second index is band, third index is G l \sigma
-        # eigvecs = np.array(eigvecs)[:, self.active_band, :]
+            eigs = np.array(eigs)
+            eigvecs = np.array(eigvecs)
 
-        # # [kx, ky, n, G, l, \sigma]
-        phiG = eigvecs.reshape(self.Nk, self.Nk, self.Nb, self.NG, 2, 2)
+            return eigs, eigvecs
 
-        # # # bug to be fixed
-        # phiGC2T = np.conj(
-        #     phiG[:, :, :, :, :, ::-1]
-        # )  # [kx, ky, n, G, l, \sigma] -> [kx, ky, n, G, l, \sigma] with layer flipped and complex conjugated
+        def C2T(eigvecs):
+            # # [kx, ky, n, G, l, \sigma]
+            phiG = eigvecs.reshape(self.Nk, self.Nk, self.Nb, self.NG, 2, 2)
 
-        # UC2T = np.einsum(
-        #     "xyngls,xymgls->xynm", np.conj(phiG), phiGC2T
-        # )  # [kx, ky, n, m]
+            # # # bug to be fixed
+            phiGC2T = np.conj(
+                phiG[:, :, :, :, :, ::-1]
+            )  # [kx, ky, n, G, l, \sigma] -> [kx, ky, n, G, l, \sigma] with layer flipped and complex conjugated
 
-        # phase = -np.angle(np.diagonal(UC2T, axis1=2, axis2=3))  # [kx, ky, n]
+            UC2T = np.einsum(
+                "xyngls,xymgls->xynm", np.conj(phiG), phiGC2T
+            )  # [kx, ky, n, m]
 
-        # phiG = phiG * np.exp(
-        #     -0.5j * phase[:, :, :, np.newaxis, np.newaxis, np.newaxis]
-        # )  # [kx, ky, n, G, l, \sigma]
+            phase = -np.angle(np.diagonal(UC2T, axis1=2, axis2=3))  # [kx, ky, n]
 
-        phiG = phiG.reshape(self.Nk * self.Nk, self.Nb, self.NG, 4)  # [k, n, G, lσ]
+            phiG = phiG * np.exp(
+                -0.5j * phase[:, :, :, np.newaxis, np.newaxis, np.newaxis]
+            )  # [kx, ky, n, G, l, \sigma]
 
-        # self.phiG = phiG
+            phiG = phiG.reshape(self.Nk * self.Nk, self.Nb, self.NG, 4)
 
-        # k+G -> -k-G
+            return phiG
 
-        # [k, G, 2]
-        kplusG = (self.kmesh[:, np.newaxis, :] + self.Gmesh[np.newaxis, :, :]).reshape(
-            -1, 2
-        )
-        tree = KDTree(kplusG)
-        _, matched_indices = tree.query(-kplusG, distance_upper_bound=1e-8)
+        eigs, eigvecs = solve(v)
+        eigsp, eigvecsp = solve(-v)
 
-        matched_indices = np.array(matched_indices)
-        matchedk = matched_indices // self.NG
-        matchedG = matched_indices % self.NG
+        # [k, n, G, lσ]
+        phiG = eigvecs.reshape(self.Nk * self.Nk, self.Nb, self.NG, 4)
+        phiGp = eigvecsp.reshape(self.Nk * self.Nk, self.Nb, self.NG, 4)
 
-        mask = matchedk < self.Nk * self.Nk
-        matchedk = matchedk[mask]
-        matchedG = matchedG[mask]
-        kindex, Gindex = np.where(mask.reshape(self.Nk * self.Nk, self.NG))
+        def regauge(phiG, phiGp, eigs, eigsp, tol=1e-4):
+            Nk2 = self.Nk * self.Nk
 
-        phiGp = np.zeros_like(phiG)
-        phiGp[kindex, :, Gindex, :] = np.conj(phiG[matchedk, :, matchedG, :])
+            kplusG = (self.kmesh[:, None, :] + self.Gmesh[None, :, :]).reshape(-1, 2)
 
+            tree = KDTree(kplusG)
+
+            dist, matched = tree.query(
+                -kplusG,
+                distance_upper_bound=1e-8,
+            )
+
+            valid = matched < kplusG.shape[0]
+            target_flat = np.arange(Nk2 * self.NG)
+
+            target_k = target_flat[valid] // self.NG
+            target_G = target_flat[valid] % self.NG
+
+            source_flat = matched[valid]  # type: ignore
+            source_k = source_flat // self.NG
+            source_G = source_flat % self.NG
+
+            phiG_tr = np.zeros_like(phiGp)
+
+            phiG_tr[target_k, :, target_G, :] = np.conj(phiG[source_k, :, source_G, :])
+
+            U = contract("kngl,kmgl->knm", np.conj(phiGp), phiG_tr)
+
+            # for diagonal sewing matrix
+            Uabs = np.abs(U)
+            nondiagonal = Uabs[:, 0, 1] > 1e-4
+            diagonal = ~nondiagonal
+
+            phase = np.angle(np.diagonal(U, axis1=1, axis2=2))
+            phiGp[diagonal] = phiGp[diagonal] * np.exp(
+                1j * phase[diagonal, :, np.newaxis, np.newaxis]
+            )
+
+            # nondiagonal sewing matrix, U(2) rotation
+            for k in np.where(nondiagonal)[0]:
+                u, s, Vh = np.linalg.svd(U[k])
+                # nearest unitary matrix to B
+                Q = u @ Vh
+                # transformation acting on row-wise band kets
+                R = Q.T
+                shape = phiGp[k].shape
+                states = phiGp[k].reshape(self.Nb, -1)
+                states = R @ states
+                phiGp[k] = states.reshape(shape)
+            return phiG, phiGp
+
+        def check_valley_sewing(phiG, phiGp):
+            Nk2 = self.Nk * self.Nk
+
+            kplusG = (self.kmesh[:, None, :] + self.Gmesh[None, :, :]).reshape(-1, 2)
+
+            tree = KDTree(kplusG)
+
+            dist, matched = tree.query(
+                -kplusG,
+                distance_upper_bound=1e-8,
+            )
+
+            valid = matched < kplusG.shape[0]
+            target_flat = np.arange(Nk2 * self.NG)
+
+            target_k = target_flat[valid] // self.NG
+            target_G = target_flat[valid] % self.NG
+
+            source_flat = matched[valid]  # type: ignore
+            source_k = source_flat // self.NG
+            source_G = source_flat % self.NG
+
+            phiG_tr = np.zeros_like(phiGp)
+
+            phiG_tr[target_k, :, target_G, :] = np.conj(phiG[source_k, :, source_G, :])
+
+            U = contract("kngl,kmgl->knm", np.conj(phiGp), phiG_tr)
+            phase = np.angle(np.diagonal(U, axis1=1, axis2=2))
+            Uabs = np.abs(U)
+
+            nondiagonal = np.where(Uabs[:, 0, 1] > 1e-4)[0]
+
+            print("nondiagonal:", nondiagonal, Uabs[nondiagonal])
+
+            idx = self.kpath.matched_indices
+            norm = self.kpath.kpathnorm
+            kidx = self.kpath.kidx
+
+            fig, ax = plt.subplots(2, 1, figsize=(6, 8), sharex=True)
+            ax[0].plot(norm, Uabs[idx, 0, 0], color="r", lw=2, label="Uabs[0,0]")
+            ax[0].plot(norm, Uabs[idx, 1, 1], color="b", lw=2, label="Uabs[1,1]")
+            ax[0].plot(norm, Uabs[idx, 0, 1], color="g", lw=2, label="Uabs[0,1]")
+            ax[0].plot(norm, Uabs[idx, 1, 0], color="y", lw=2, label="Uabs[1,0]")
+            ax[0].set_xlim(0, norm[-1])
+            ax[0].set_xticks([norm[i] for i in kidx], ["K", "G", "M", "K'"])
+            for i in kidx:
+                ax[0].axvline(x=norm[i], color="k", linestyle="--")
+            ax[0].legend()
+
+            ax[1].plot(norm, phase[idx, 0], color="r", lw=2, label="phase[0,0]")
+            ax[1].plot(norm, phase[idx, 1], color="b", lw=2, label="phase[1,1]")
+
+            plt.show()
+
+            fig, ax = plt.subplots(figsize=(6, 6))
+            plt.scatter(self.kmesh[:, 0], self.kmesh[:, 1], s=10, color="k")
+
+            plt.scatter(
+                self.kmesh[nondiagonal, 0], self.kmesh[nondiagonal, 1], s=50, color="b"
+            )
+            plt.plot(self.mbz[:, 0], self.mbz[:, 1], color="r", linewidth=2)
+
+            plt.arrow(0, 0, self.G[0, 0], self.G[0, 1], color="b", head_width=0.05)
+            plt.arrow(0, 0, self.G[1, 0], self.G[1, 1], color="y", head_width=0.05)
+
+            plt.plot(
+                self.kmesh[self.kpath[2], 0], self.kmesh[self.kpath[2], 1], c="g", lw=2
+            )
+            ax.set_aspect("equal")
+            plt.show()
+
+        # phiG = C2T(eigvecs)
+        # phiGp = C2T(eigvecsp)
         if self.test:
-            print("kplusG size:", kplusG.shape)
-
-            print("matched_indices", matched_indices)
+            check_valley_sewing(phiG, phiGp)
+        phiG, phiGp = regauge(phiG, phiGp, eigs, eigsp)
 
         self.phiG = phiG.transpose(1, 0, 3, 2)  # [n, k, lσ, G]
         self.phiGp = phiGp.transpose(1, 0, 3, 2)  # [n, k, lσ, G]
 
-        Nx, Ny = np.meshgrid(np.arange(self.Nk), np.arange(self.Nk), indexing="ij")
-        Nx = Nx.flatten()
-        Ny = Ny.flatten()
-        Nxm, Nym = -Nx % self.Nk, -Ny % self.Nk
-
-        kmeshm = self.kmesh.reshape(self.Nk, self.Nk, 2)[Nxm, Nym]
-
-        diff = (np.abs(kmeshm[:, np.newaxis] - self.kmesh[np.newaxis, :]) < 1e-10).all(
-            axis=-1
-        )
-        midx, idx = np.where(diff)
-        eigsp = np.zeros_like(eigs)
-        eigsp[midx, :] = eigs[idx, :]
-
         # [k, n]
         self.eigs = eigs
         self.eigsp = eigsp
+        if self.test:
+            check_valley_sewing(phiG, phiGp)
 
         if self.test:
             fig, ax = plt.subplots(figsize=(6, 8))
@@ -765,7 +1022,7 @@ class HFHamSetter(BMHamSetter):
 
         H = H.reshape(self.Nk * self.Nk, self.ntotal, self.ntotal)
         F = F.reshape(self.Nk * self.Nk, self.ntotal, self.ntotal)
-        ham = self.K + H + F
+        ham = self.K + F + H
 
         # if self.test:
         #     print(
@@ -774,7 +1031,7 @@ class HFHamSetter(BMHamSetter):
 
         return ham
 
-    def getdm(self, eigs, states, filling):
+    def getdm(self, eigs, states, filling, deg_tol=1e-8):
         # here we define density matrix as Dij=<ci^dagger cj> = sum_{occupied n} <i|n><n|j>
         # in some paper Dji=<ci^dagger cj>
         # for the defination <A>=Tr(AD^T)
@@ -783,26 +1040,43 @@ class HFHamSetter(BMHamSetter):
 
         occupied_num = (filling + 4 * self.Nb // 2) * (self.Nk * self.Nk)
         sorted_indices = np.argsort(eigs)
-        occupied_indices = sorted_indices[0 : int(occupied_num)]
 
-        fermi_energy = eigs[occupied_indices[-1]]
+        occ = np.zeros_like(eigs)
 
-        occupiedk = occupied_indices // self.ntotal
-        occupiedn = occupied_indices % self.ntotal
+        fermi_energy = eigs[sorted_indices[occupied_num - 1]]
+
+        below = eigs < fermi_energy - deg_tol
+
+        deg = np.abs(eigs - fermi_energy) < deg_tol
+
+        occ[below] = 1.0
+
+        deg_num = np.sum(deg)
+        if deg_num > 0:
+            occ[deg] = (occupied_num - np.sum(below)) / deg_num
+
+        occ = occ.reshape(self.Nk * self.Nk, self.ntotal)
+
+        # occupied_indices = sorted_indices[0 : int(occupied_num)]
+
+        # occupiedk = occupied_indices // self.ntotal
+        # occupiedn = occupied_indices % self.ntotal
 
         dm = np.zeros(
             (self.Nk * self.Nk, self.ntotal, self.ntotal), dtype=np.complex128
         )
 
         for k in range(self.Nk * self.Nk):
-            occupied_states_k = states[k][occupiedn[occupiedk == k]]
-            dm[k] = contract("mi,mj->ij", np.conj(occupied_states_k), occupied_states_k)
+            # occupied_states_k = states[k][occupiedn[occupiedk == k]]
+            dm[k] = contract("m,mi,mj->ij", occ[k], np.conj(states[k]), states[k])
 
         dm = dm.reshape(self.Nk * self.Nk, self.Nb, 2, 2, self.Nb, 2, 2)
 
         if not self.spin_coherence:
             dm[:, :, 0, :, :, 1, :] = 0
             dm[:, :, 1, :, :, 0, :] = 0
+
+        if not self.spin_polarization:
 
             dm_up = dm[:, :, 0, :, :, 0, :]
             dm_down = dm[:, :, 1, :, :, 1, :]
@@ -815,6 +1089,8 @@ class HFHamSetter(BMHamSetter):
         if not self.valley_coherence:
             dm[:, :, :, 0, :, :, 1] = 0
             dm[:, :, :, 1, :, :, 0] = 0
+
+        if not self.valley_polarization:
 
             dm_K = dm[:, :, :, 0, :, :, 0]
             dm_Kp = dm[:, :, :, 1, :, :, 1]
@@ -829,22 +1105,25 @@ class HFHamSetter(BMHamSetter):
         return dm, fermi_energy
 
     def scf(self, filling):
-        dm = random_density_matrix(
-            self.Nk * self.Nk,
-            self.Nb,
-            filling,
-            self.spin_coherence,
-            self.valley_coherence,
-            seed=20260911,
-        )
+        # dm = random_density_matrix(
+        #     self.Nk * self.Nk,
+        #     self.Nb,
+        #     filling,
+        #     self.spin_coherence,
+        #     self.valley_coherence,
+        #     seed=20260914,
+        # )
 
         # dm = init_c2ti(self.Nk * self.Nk, sign=1)
 
         # dm = init_fmi_valley(self.Nk * self.Nk, valley=0)
 
+        dm = init_ivc(self.Nk * self.Nk, valley_direction="x", sign=1)
+
         step = 0
 
         while True:
+
             ham = self.hamhf(dm)
 
             def f(k):
@@ -888,8 +1167,8 @@ class HFHamSetter(BMHamSetter):
         dmdiff = nextdmk - dmk
         hamdiff = nexthamk - hamk
 
-        s = 2 * contract("kij,kij->", hamk, dmdiff.conj())
-        c = contract("kij,kij->", hamdiff, dmdiff.conj())
+        s = 2 * contract("kij,kij->", hamk, dmdiff)
+        c = contract("kij,kij->", hamdiff, dmdiff)
 
         lambda_opt = -s / (2 * c) if c > -s / 2 else 1.0
 
@@ -906,7 +1185,7 @@ class HFHamSetter(BMHamSetter):
 
     def total_energy(self, dm):
         ham = self.hamhf(dm)
-        energy = contract("kij,kij->", self.K + ham, dm.conj()) / 2
+        energy = contract("kij,kij->", self.K + ham, dm) / 2
         return energy / (self.Nk * self.Nk)
 
 
@@ -914,11 +1193,14 @@ if __name__ == "__main__":
     ENV.redirect_output()
     hf = HFHamSetter(
         test=False,
-        cutoff=6,
-        Nk=24,
-        spin_coherence=True,
+        cutoff=5,
+        Nk=12,
+        spin_coherence=False,
         valley_coherence=True,
+        spin_polarization=False,
+        valley_polarization=True,
         max_iter=200,
+        ref_type=1,
     )
     dm, eigs, states, fermi = hf.scf(filling=0)
 
@@ -944,9 +1226,10 @@ if __name__ == "__main__":
     plt.axhline(y=fermi, color="b", lw=2, ls="--", label="Fermi energy")
     for i in hf.kpath.kidx:
         ax.axvline(x=hf.kpath.kpathnorm[i], color="k", linestyle="--")
-    plt.yticks((-0.04, -0.02, 0, 0.02, 0.04))
-    plt.yticks((-0.03, -0.01, 0.01, 0.03), minor=True)
+    # plt.yticks((-0.04, -0.02, 0, 0.02, 0.04))
+    # plt.yticks((-0.03, -0.01, 0.01, 0.03), minor=True)
     ax.tick_params(direction="in", axis="y")
-    plt.ylim(-0.05, 0.05)
+    # plt.ylim(-0.05, 0.05)
     plt.ylabel("Energy (eV)")
-    plt.savefig("eigs.png", dpi=300, bbox_inches="tight")
+    plt.show()
+    # plt.savefig("eigs.png", dpi=300, bbox_inches="tight")
