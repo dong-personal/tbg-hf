@@ -4,6 +4,9 @@ import numpy as np
 from dataclasses import dataclass
 from scipy.sparse import block_diag
 import matplotlib.pyplot as plt
+import matplotlib
+
+print(matplotlib.get_backend())
 
 
 def gen_kpath(kpoints, num_kpoints):
@@ -136,6 +139,9 @@ class BMHamSetter:
         self.preft = self.Rt.T @ (I + self.E_t)
         self.prefb = self.Rb.T @ (I + self.E_b)
 
+        # self.preft = I
+        # self.prefb = I
+
         self.ctp, self.cbp = self._build_strain_correction(v=1)
         self.ctn, self.cbn = self._build_strain_correction(v=-1)
 
@@ -171,6 +177,12 @@ class BMHamSetter:
 
         self.G = np.array([[-1, -1], [1, 0]]) @ self.G
 
+        # rot G[0] to x-axis
+        cos_theta = self.G[0, 0] / np.linalg.norm(self.G[0])
+        sin_theta = self.G[0, 1] / np.linalg.norm(self.G[0])
+        rot = np.array([[cos_theta, sin_theta], [-sin_theta, cos_theta]])
+        self.G = self.G @ rot.T
+
         K0 = (b0[0] + 2 * b0[1]) / 3.0
 
         KT = (I - self.E_b) @ self.Rt @ K0
@@ -205,6 +217,16 @@ class BMHamSetter:
         # self.WScell = np.array([q1R, -q3R, q2R, -q1R, q3R, -q2R, q1R])
         self.WScell = ws_cell(self.lat[0], self.lat[1], N=4)
 
+        if self.test:
+            fig, ax = plt.subplots(figsize=(6, 6))
+            plt.plot(self.mbz[:, 0], self.mbz[:, 1], color="blue", lw=2, label="MBZ")
+            plt.plot([0, self.G[0, 0]], [0, self.G[0, 1]], "b--", label="G1")
+            plt.plot([0, self.G[1, 0]], [0, self.G[1, 1]], "y--", label="G2")
+
+            plt.legend()
+            ax.set_aspect("equal")
+            plt.show()
+
     def _build_Gmesh(self):
 
         Gcut = self.cutoff * np.max(np.linalg.norm(self.G, axis=1))
@@ -222,7 +244,7 @@ class BMHamSetter:
         self.Gmesh = Gmesh[index][sort_index]
 
         self.NG = len(self.Gmesh)
-
+        print(f"Number of G points: {len(self.Gmesh)}")
         if self.test:
             A_cell = np.array(
                 [
@@ -233,7 +255,7 @@ class BMHamSetter:
                     0 * self.G[0],
                 ]
             )
-            print(f"Number of G points: {len(self.Gmesh)}")
+
             fig, ax = plt.subplots(figsize=(6, 6))
             plt.scatter(self.Gmesh[:, 0], self.Gmesh[:, 1], color="blue", s=10)
             plt.title("G mesh points")
@@ -249,8 +271,6 @@ class BMHamSetter:
             ax.set_aspect("equal")
             plt.show()
 
-            # exit()
-
     def _build_tunneling_matrix(self, v):
 
         omega = np.exp(2j * np.pi / 3)
@@ -262,7 +282,7 @@ class BMHamSetter:
             ]
         )
         T2 = T1.T
-        tn = [T0, T1, T2]
+        tn = [T2, T0, T1]
         GN = np.array([[0, 0], -v * self.G[1], v * self.G[0]])
 
         Gdiff = self.Gmesh[:, np.newaxis, :] - self.Gmesh[np.newaxis, :, :]
@@ -285,9 +305,6 @@ class BMHamSetter:
         self.hdim = size
 
         return hamv
-
-    def _build_tunnelling_matrix(self, v):
-        pass
 
     def h0(self, k, v):
         H0 = -self.hv * np.array(
@@ -316,15 +333,14 @@ class BMHamSetter:
         H = H + T
         return H
 
-    def set_uni(self, eh, phi):
+    def set_uni(self, eh, phi, ebi=0):
         nv = 0.16
 
-        eh = eh / 100
-        phi = np.deg2rad(phi)
+        eh = eh
 
-        exx = eh * (np.cos(phi) ** 2 - nv * np.sin(phi) ** 2)
-        eyy = eh * (np.sin(phi) ** 2 - nv * np.cos(phi) ** 2)
-        exy = eh * (1 + nv) * np.sin(phi) * np.cos(phi)
+        exx = eh * (np.cos(phi) ** 2 - nv * np.sin(phi) ** 2) * (1 + ebi)
+        eyy = eh * (np.sin(phi) ** 2 - nv * np.cos(phi) ** 2) * (1 + ebi)
+        exy = eh * (1 + nv) * np.sin(phi) * np.cos(phi) * (1 + ebi)
 
         # Symmetric configuration
 
@@ -337,7 +353,7 @@ class BMHamSetter:
         self.eyyB = -eyy / 2
 
     def set_shear(self, eh, phi):
-        eh = eh / 100
+        eh = eh
         phi = np.deg2rad(phi)
 
         exx = -eh * np.sin(2 * phi)
@@ -381,7 +397,12 @@ class BMHamSetter:
 
 if __name__ == "__main__":
 
-    ham = BMHamSetter(trad=np.deg2rad(1.05), eh=0, phi=0)
+    ham = BMHamSetter(
+        trad=np.deg2rad(1.05),
+        eh=0.0010107811548119847 * 0,
+        phi=np.deg2rad(0.5266525143534672),
+        cutoff=3,
+    )
     eigs, kidx = ham.calc_band(v=-1, knum=200)
     eigs = np.array(eigs).T
     plt.figure(figsize=(6, 4))

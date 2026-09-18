@@ -9,7 +9,7 @@ from opt_einsum import contract
 from collections import namedtuple
 import numpy as np
 
-from solver.mpi import ENV
+from mpi import ENV
 
 
 def haar_unitary(N, rng):
@@ -509,7 +509,7 @@ class HFHamSetter(BMHamSetter):
 
     epsilon: float = 7
 
-    max_iter: int = 200
+    max_iter: int = 10
 
     mix: float = 0.2
 
@@ -844,8 +844,8 @@ class HFHamSetter(BMHamSetter):
             ax.set_aspect("equal")
             plt.show()
 
-        # phiG = C2T(eigvecs)
-        # phiGp = C2T(eigvecsp)
+        phiG = C2T(eigvecs)
+        phiGp = C2T(eigvecsp)
         if self.test:
             check_valley_sewing(phiG, phiGp)
         phiG, phiGp = regauge(phiG, phiGp, eigs, eigsp)
@@ -896,14 +896,14 @@ class HFHamSetter(BMHamSetter):
 
         mask = matched_indices < self.NG
 
-        # [n, k, lσ, G, Q]
+        # [n, p, lσ, G, Q]
         phiGG = np.zeros(
             (*(self.phiG.shape[0:-1]), self.NG * self.NG), dtype=np.complex128
         )
         phiGG[..., mask] = self.phiG[..., matched_indices[mask]]
         phiGG = phiGG.reshape((*self.phiG.shape, self.NG))
 
-        form_factors = contract("mpigq, nkig->mnkpq", np.conj(phiGG), self.phiG)
+        form_factors = contract("mpigq, nkig->mnpkq", np.conj(phiGG), self.phiG)
 
         # form_factors = contract("mpig, nkigq->mnkpq", np.conj(self.phiG), phiGG)
 
@@ -913,9 +913,9 @@ class HFHamSetter(BMHamSetter):
         phiGGp[..., mask] = self.phiGp[..., matched_indices[mask]]
         phiGGp = phiGGp.reshape((*self.phiGp.shape, self.NG))
 
-        form_factorsp = contract("mpigq, nkig->mnkpq", np.conj(phiGGp), self.phiGp)
+        form_factorsp = contract("mpigq, nkig->mnpkq", np.conj(phiGGp), self.phiGp)
 
-        # [v, m, n, k, p, Q]
+        # [v, m, n, p, k, Q]
         return np.stack((form_factors, form_factorsp), axis=0)
 
     def _build_kinetic(self):
@@ -977,10 +977,10 @@ class HFHamSetter(BMHamSetter):
         form_factors = self._build_form_factor()
         conj = np.conj(form_factors)
 
-        # q = -k + p + Q
+        # q =  p -k + Q
         kminuskpminusG = (
-            -self.kmesh[:, np.newaxis, np.newaxis, :]
-            + self.kmesh[np.newaxis, :, np.newaxis, :]
+            self.kmesh[:, np.newaxis, np.newaxis, :]
+            - self.kmesh[np.newaxis, :, np.newaxis, :]
             + self.Gmesh[np.newaxis, np.newaxis, :, :]
         )
 
@@ -991,7 +991,7 @@ class HFHamSetter(BMHamSetter):
         self.VH = contract("q, vmrkkq, Vsnppq->kpmnvrsV", VcG, form_factors, conj)
 
         # D rn C ms
-        self.VF = contract("kpq, vmrkpq, Vsnkpq->kpmnvrsV", VcF, form_factors, conj)
+        self.VF = contract("pkq, vmrpkq, Vsnpkq->kpmnvrsV", VcF, form_factors, conj)
 
     def hamhf(self, dm):
         # dm: [k, nsv, n's'v']
@@ -1116,9 +1116,9 @@ class HFHamSetter(BMHamSetter):
 
         # dm = init_c2ti(self.Nk * self.Nk, sign=1)
 
-        # dm = init_fmi_valley(self.Nk * self.Nk, valley=0)
+        dm = init_fmi_valley(self.Nk * self.Nk, valley=0)
 
-        dm = init_ivc(self.Nk * self.Nk, valley_direction="x", sign=1)
+        # dm = init_ivc(self.Nk * self.Nk, valley_direction="x", sign=1)
 
         step = 0
 
@@ -1185,8 +1185,10 @@ class HFHamSetter(BMHamSetter):
 
     def total_energy(self, dm):
         ham = self.hamhf(dm)
-        energy = contract("kij,kij->", self.K + ham, dm) / 2
-        return energy / (self.Nk * self.Nk)
+        energy = contract("kij,kij->", self.K + ham, dm - self.dmref) / 2
+
+        Ne = np.sum(np.diagonal(dm, axis1=1, axis2=2))
+        return np.real(energy / Ne)
 
 
 if __name__ == "__main__":
@@ -1207,7 +1209,7 @@ if __name__ == "__main__":
     ivc = hf.IVC(dm)
     print("IVC:", ivc)
 
-    total_energy = np.abs(hf.total_energy(dm))
+    total_energy = hf.total_energy(dm)
     print("Total energy:", total_energy)
 
     # eigs [k,nsv]
@@ -1226,10 +1228,10 @@ if __name__ == "__main__":
     plt.axhline(y=fermi, color="b", lw=2, ls="--", label="Fermi energy")
     for i in hf.kpath.kidx:
         ax.axvline(x=hf.kpath.kpathnorm[i], color="k", linestyle="--")
-    # plt.yticks((-0.04, -0.02, 0, 0.02, 0.04))
-    # plt.yticks((-0.03, -0.01, 0.01, 0.03), minor=True)
+    plt.yticks((-0.04, -0.02, 0, 0.02, 0.04))
+    plt.yticks((-0.03, -0.01, 0.01, 0.03), minor=True)
     ax.tick_params(direction="in", axis="y")
-    # plt.ylim(-0.05, 0.05)
+    plt.ylim(-0.05, 0.05)
     plt.ylabel("Energy (eV)")
     plt.show()
     # plt.savefig("eigs.png", dpi=300, bbox_inches="tight")
