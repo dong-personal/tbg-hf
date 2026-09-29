@@ -60,6 +60,7 @@ def ws_cell(b1, b2, N=4):
     # 按角度排序，便于画多边形
     center = vertices.mean(axis=0)
     angles = np.arctan2(vertices[:, 1] - center[1], vertices[:, 0] - center[0])
+    angles = np.mod(angles, 2 * np.pi)  # 将角度限制在 [0, 2π] 范围内
     order = np.argsort(angles)
     vertices = vertices[order]
     poly = np.vstack([vertices, vertices[0]])  # 闭合多边形
@@ -85,7 +86,7 @@ def fold(kpoints, b1, b2, N=4):
 class BMHamSetter:
     trad: float = np.deg2rad(1.086)
     dcc: float = 0.142
-    hv: float = 2.365 * np.sqrt(3) * dcc * 1
+    hv: float = 2.8 * 3 / 2 * dcc * 1
     gammaAA: float = 0.08
     gammaAB: float = 0.11
     a: float = 0.246
@@ -99,6 +100,7 @@ class BMHamSetter:
     eh: float = 0
     phi: float = 0
     strain_type: str = "uni"
+    ebi: float = 0
 
     # exxT: float = 0
     # eyyT: float = 0
@@ -112,7 +114,7 @@ class BMHamSetter:
 
     def __post_init__(self):
         if self.strain_type == "uni":
-            self.set_uni(self.eh, self.phi)
+            self.set_uni(self.eh, self.phi, self.ebi)
         elif self.strain_type == "shear":
             self.set_shear(self.eh, self.phi)
         else:
@@ -190,11 +192,15 @@ class BMHamSetter:
 
         self.KT = fold(KT, self.G[0], self.G[1], N=4)
         self.KB = fold(KB, self.G[0], self.G[1], N=4)
+        self.mbz = ws_cell(self.G[0], self.G[1], N=4)
 
-        q1 = (self.G[0] - self.G[1]) / 3.0
-        q2 = q1 + self.G[1]
-        q3 = q1 - self.G[0]
+        # q1 = (self.G[0] - self.G[1]) / 3.0
+        # q2 = q1 + self.G[1]
+        # q3 = q1 - self.G[0]
 
+        q1 = self.mbz[-1]
+        q2 = self.mbz[1]
+        q3 = -self.mbz[0]
         self.Kt = q2
         self.Kb = -q3
 
@@ -202,7 +208,6 @@ class BMHamSetter:
         # self.Kb = self.KB
 
         # self.mbz = np.array([q1, -q3, q2, -q1, q3, -q2, q1])
-        self.mbz = ws_cell(self.G[0], self.G[1], N=4)
 
         self.Acr = np.abs(np.linalg.det(self.G))
 
@@ -216,12 +221,32 @@ class BMHamSetter:
 
         # self.WScell = np.array([q1R, -q3R, q2R, -q1R, q3R, -q2R, q1R])
         self.WScell = ws_cell(self.lat[0], self.lat[1], N=4)
+        self.kpoints = {
+            "G": np.array([0, 0]),
+            "M": self.G[0] / 2,
+            "K": self.mbz[0],
+            "K'": self.mbz[1],
+        }
 
         if self.test:
             fig, ax = plt.subplots(figsize=(6, 6))
             plt.plot(self.mbz[:, 0], self.mbz[:, 1], color="blue", lw=2, label="MBZ")
             plt.plot([0, self.G[0, 0]], [0, self.G[0, 1]], "b--", label="G1")
             plt.plot([0, self.G[1, 0]], [0, self.G[1, 1]], "y--", label="G2")
+
+            kpoints = np.array(
+                [
+                    [0, 0],
+                    self.G[0] / 2.0,
+                    # (2 * self.G[0] + self.G[1]) / 3.0,
+                    self.mbz[0],
+                    [0, 0],
+                    # (2 * self.G[1] + self.G[0]) / 3.0,
+                    self.mbz[1],
+                ]
+            )
+
+            plt.plot(kpoints[:, 0], kpoints[:, 1], "r--", lw=2, label="K path")
 
             plt.legend()
             ax.set_aspect("equal")
@@ -333,7 +358,7 @@ class BMHamSetter:
         H = H + T
         return H
 
-    def set_uni(self, eh, phi, ebi=0):
+    def set_uni(self, eh, phi, ebi=0.0):
         nv = 0.16
 
         eh = eh
@@ -378,10 +403,10 @@ class BMHamSetter:
         kpoints = np.array(
             [
                 [0, 0],
-                self.G[1] / 2.0,
-                (2 * self.G[1] + self.G[0]) / 3.0,
-                [0, 0],
+                self.G[0] / 2.0,
                 (2 * self.G[0] + self.G[1]) / 3.0,
+                [0, 0],
+                (2 * self.G[1] + self.G[0]) / 3.0,
             ]
         )
 
@@ -392,24 +417,30 @@ class BMHamSetter:
             H = self.ham(k, v)
             eigs.append(np.linalg.eigvalsh(H))
 
-        return eigs, kidx
+        klength = np.linalg.norm(kpoints[1:] - kpoints[:-1], axis=1)
+        kpath = np.concatenate([[0], np.cumsum(klength)])
+        return eigs, kidx, kpath
 
 
 if __name__ == "__main__":
 
     ham = BMHamSetter(
-        trad=np.deg2rad(1.05),
-        eh=0.0010107811548119847 * 0,
-        phi=np.deg2rad(0.5266525143534672),
-        cutoff=3,
+        trad=np.deg2rad(1.04450745),
+        eh=-0.00291450,
+        phi=np.deg2rad(0.52225372),
+        ebi=0.00000425,
+        cutoff=5,
+        test=True,
+        gammaAA=0.11,
+        gammaAB=0.11,
     )
     eigs, kidx = ham.calc_band(v=-1, knum=200)
     eigs = np.array(eigs).T
-    plt.figure(figsize=(6, 4))
+    plt.figure(figsize=(8, 8))
     for i in range(eigs.shape[0]):
         plt.plot(eigs[i], color="black", lw=1)
     plt.xlim(0, 200)
-    plt.ylim(-0.075, 0.075)
+    plt.ylim(-0.08, 0.08)
     plt.xticks(kidx, [r"$\Gamma$", "M", "K", r"$\Gamma$", "K'"])
     plt.ylabel("Energy (eV)")
     plt.title("Twisted Bilayer Graphene Band Structure")

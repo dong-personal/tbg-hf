@@ -10,6 +10,8 @@ from solver.cell import Cell
 from gen_struct import a0, zspace, gen_struct_strain, gen_struct
 
 from dataclasses import dataclass
+from solver.mpi import ENV
+from datetime import datetime
 
 
 # 0.3637, 0.3349
@@ -109,6 +111,7 @@ class TBHamSetter:
     eng_max: float = 0.9
     predict_num: int = 40
     test: bool = False
+    write_poscar: bool = True
 
     def __post_init__(self):
 
@@ -137,7 +140,8 @@ class TBHamSetter:
             f"Cell has {self.cell.num_orb} orbitals and {self.cell.num_hop} hoppings."
         )
 
-        write_poscar(f"data/{self.datetime_str}.vasp", self.cell, self.note)
+        if self.write_poscar:
+            write_poscar(f"data/{self.datetime_str}.vasp", self.cell, self.note)
 
         self.G = get_rlat(self.cell.lat)
 
@@ -158,23 +162,35 @@ class TBHamSetter:
 
         self.fbz = get_fbz(self.G[0:2, 0:2])
 
+        self.WScell = get_fbz(self.cell.lat[0:2, 0:2])
+
         self.knum = 400
         kpoints = np.array(
             [
                 [0, 0, 0],
                 self.G[0] / 2.0,
-                (2 * self.G[0] + self.G[1]) / 3.0,
+                [*self.fbz[0], 0],
+                # (2 * self.G[0] + self.G[1]) / 3.0,
                 [0, 0, 0],
-                (2 * self.G[1] + self.G[0]) / 3.0,
+                # (2 * self.G[1] + self.G[0]) / 3.0,
+                [*self.fbz[1], 0],
             ]
         )
         kidx, kpath = gen_kpath(kpoints, self.knum)
+        klength = np.linalg.norm(kpoints[1:] - kpoints[:-1], axis=1)
+        kpath1d = np.concatenate([[0], np.cumsum(klength)])
 
         kpath = np.dot(kpath, np.linalg.inv(self.G))
 
         self.kidx = [kidx]
         self.kpath = [kpath]
-        self.kpoints = {"G": kpoints[0]}
+        self.kpath1d = [kpath1d]
+        self.kpoints = {
+            "G": kpoints[0],
+            "M": kpoints[1],
+            "K": kpoints[2],
+            "K'": kpoints[4],
+        }
         if self.test:
             kpath = np.dot(kpath, self.G)
             fig, ax = plt.subplots(figsize=(6, 6))
@@ -203,10 +219,10 @@ class TBHamSetter:
 
         return result
 
-    def calc_state(self, kpoint, eng, num):
+    def calc_state(self, kpoint):
 
         ham_setter = self.solver.ham_setter()
-        ham = ham_setter(self.kpoints[kpoint])
+        ham = ham_setter(self.kpoints[kpoint].dot(np.linalg.inv(self.G)))
 
         eigval, eigvec = self.feast_solver(ham)
 
@@ -343,10 +359,9 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import shutil
     from valley import valley_operator
-    from datetime import datetime
 
     ENV.redirect_output()
-    uni = 0.001
+    uni = -0.003
     ham = TBHamSetter(test=False, uni_given=uni)
     eng = ham.calc_band(0)
 
@@ -354,18 +369,20 @@ if __name__ == "__main__":
     if ENV.rank == 0:
         write_data(f"data/band{datetime_str}.txt", eng, note=ham.note)
 
-        plt.figure(figsize=(6, 8))
+        plt.figure(figsize=(8, 8))
         for i, eigs in enumerate(eng):
-            plt.scatter(np.full(eigs.shape, i), eigs, s=1.5, color="red", zorder=2)
+            plt.scatter(
+                np.full(eigs.shape, i), eigs - 0.81, s=1.5, color="red", zorder=2
+            )
 
         kidx = ham.kidx[0]
         plt.xticks(kidx, ["G", "M", "K", "G", "K'"])
         for i in range(1, len(kidx) - 1):
             plt.axvline(x=kidx[i], color="grey", linestyle="--", linewidth=2, zorder=1)
         plt.xlim((0, kidx[-1]))
-        plt.ylim(0.7, 0.9)
+        plt.ylim(-0.08, 0.08)
         plt.tight_layout()
-        plt.savefig("plot/band.png", bbox_inches="tight", dpi=600)
+        plt.savefig(f"plot/band{datetime_str}.png", bbox_inches="tight", dpi=600)
 
     # ENV.redirect_output()
 

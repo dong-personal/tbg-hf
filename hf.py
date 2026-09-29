@@ -2,7 +2,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 from dataclasses import dataclass
 
-from ham import BMHamSetter
+from cm import BMHamSetter
 from scipy.spatial import KDTree
 from opt_einsum import contract
 

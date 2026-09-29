@@ -168,6 +168,46 @@ def PMMat(ijs, mnp):
     #     raise ValueError("The gcd of the matrix is not 1")
 
 
+def PMMat_symmetric(ijs, mnp):
+    ((i, k), (j, l)), ((m, q), (n, r)) = ijs, mnp
+
+    mat = np.array([[l * m - j * q, l * n - j * r], [-k * m + i * q, -k * n + i * r]])
+
+    coef = i * l - j * k
+
+    pmmat = mat / (coef * 1.0)
+    # (a, b), (c, d) = pmmat
+    P = np.array([[1, 0], [1 / 2, np.sqrt(3) / 2]])
+    B = np.linalg.inv(P).dot(pmmat).dot(P)
+    (x, y), (z, w) = B
+    theta = np.arctan2(z - y, x + w)
+
+    R = rotation_matrix(theta / 2.0)
+
+    # ca = np.cos(theta / 2.0)
+    # sa = np.sin(theta / 2.0)
+    C = np.dot(R.T, np.dot(B, R.T))
+
+    u, v, s = C[0, 0], C[0, 1], C[1, 1]
+
+    D = (u + 1) * (s + 1) - v**2
+
+    exx = 2 * ((u - 1)(s + 1) - v**2) / D
+    eyy = 2 * ((s - 1)(u + 1) - v**2) / D
+    exy = 4 * v / D
+
+    T = exx + eyy
+    D = np.sqrt((exx - eyy) ** 2 + 4 * exy**2)
+
+    eb = 1 / 2.0 * (T - (1 - pson) / (1 + pson) * D)
+
+    euni = D / (1 + eb) / (1 + pson)
+
+    phi = 1 / 2.0 * np.arctan2(2 * exy, exx - eyy)
+
+    return (theta, euni, phi, eb)
+
+
 def get_moire_lattice(theta_t, epsilon, theta_s, biaxial_strain):
 
     strain_matrix = S_mat(theta_s, epsilon) / (1 + biaxial_strain)

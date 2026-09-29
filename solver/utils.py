@@ -49,6 +49,7 @@ def get_fbz(rlat):
     # 按角度排序，便于画多边形
     center = vertices.mean(axis=0)
     angles = np.arctan2(vertices[:, 1] - center[1], vertices[:, 0] - center[0])
+    angles = np.mod(angles, 2 * np.pi)  # 将角度限制在 [0, 2π] 范围内
     order = np.argsort(angles)
     vertices = vertices[order]
     poly = np.vstack([vertices, vertices[0]])  # 闭合多边形
